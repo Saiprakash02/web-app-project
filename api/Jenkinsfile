@@ -154,7 +154,7 @@ CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", "--access-log
                 withCredentials([aws(credentialsId: 'aws-cred', region: AWS_REGION)]) {
                     withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'kubeconfig', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
                         def apiLabels = [
-                            "prod": "app=production-api"
+                            "dev": "app=development-api"
                         ]
 
                         apiLabels.each { namespace, label ->
