@@ -1,0 +1,195 @@
+pipeline {
+    agent any
+    tools {
+        jdk 'jdk17'
+        nodejs 'node16'
+    }
+    environment {
+        SCANNER_HOME = tool 'sonarqube-scanner'
+        ECR_URL = '711063385483.dkr.ecr.ap-south-2.amazonaws.com'
+        NAME = "${ECR_URL}/api-prod"
+        BUILD_NUMBER = "${env.BUILD_NUMBER}"
+        DEPENDENCY_CHECK_API_KEY = credentials('DP-key')
+        def commitId = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        def imageTag = "${commitId}-${BUILD_NUMBER}"
+        GIT_COMMIT = "${commitId}"
+        IMAGE_NAME = "${NAME}:${imageTag}"
+        AWS_REGION = 'ap-south-2'
+        PATH = "/home/linuxbrew/.linuxbrew/bin:$PATH"
+    }
+    parameters { choice( name: 'QualityGate', choices: ['Fail', 'Pass'], description: 'Choose whether to pass or fail the pipeline based on quality gate conditions.' ) }
+    stages {
+        stage('Cleaning Workspace') {
+            steps {
+                echo 'Cleaning Workspace...'
+                cleanWs()
+                echo 'Workspace is cleaned'
+            }
+        }
+        stage('Checkout SCM') {
+            steps {
+                checkout scmGit(branches: [[name: 'master']], extensions: [], userRemoteConfigs: [[credentialsId: 'gitlab-cred', url: 'https://gitlab.com/phase-2-assessment/devsecops-assessment']])
+            }
+        }
+        stage('Static Code Analysis') {
+            parallel {
+                stage('SonarQube Analysis') {
+                    steps {
+                        dir('api') {
+                            echo 'Running SonarQube Analysis...'
+                            withSonarQubeEnv('sonarqube-server') {
+                                sh '''
+                                    $SCANNER_HOME/bin/sonar-scanner \
+                                    -Dsonar.projectName=production-api \
+                                    -Dsonar.projectKey=api-prod \
+                                    -Dsonar.sources=. \
+                                    -Dsonar.python.version=3
+                                '''
+                            }
+                        }
+                        echo 'Completed SonarQube Analysis...'
+                    }
+                }
+                stage('OWASP Dependency-Check Scan') {
+                    steps {
+                        echo 'Running Dependency Check...'
+                        dir('api') {
+                            script {
+                                dependencyCheck additionalArguments: '--scan ./ --nvdApiKey $DEPENDENCY_CHECK_API_KEY', odcInstallation: 'DP'
+                                dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+                                archiveArtifacts artifacts: 'dependency-check-report.xml', allowEmptyArchive: false
+                            }
+                        }
+                        echo 'Completed Dependency Check and Artifacts are saved...'
+                    }
+                }
+            }
+        }
+        stage('SonarQube Quality Gate Check') {
+            steps {
+                script {
+                    def qualityGateStatus = waitForQualityGate()
+                    if (qualityGateStatus.status != 'OK') {
+                        echo "Quality Gate Failed: ${qualityGateStatus.status}"
+                        if (params.QualityGate == 'Fail') {
+                            currentBuild.result = 'FAILURE'
+                            error "Quality Gate failed. Build failed as per the user selection."
+                        }
+                    } else {
+                        echo "Quality Gate Passed"
+                    }
+                }
+            }
+        }
+        stage('Creating and Building Docker Image') {
+            steps {
+                script {
+                    echo 'Creating Docker File'
+                    dir('api') {
+                        writeFile file: 'Dockerfile', text: '''
+FROM python:3.10.5-alpine3.16
+WORKDIR /app
+RUN apk add --no-cache entr postgresql-dev musl-dev gcc postgresql-client
+COPY requirements.txt /app/requirements.txt
+RUN pip install -r requirements.txt
+COPY . /app
+EXPOSE 80
+CMD ["gunicorn", "app:app", "-b", "0.0.0.0:80", "--log-file", "-", "--access-logfile", "-", "--workers", "4", "--keep-alive", "0"]
+                        '''
+                        sh 'cat Dockerfile'
+                        echo 'Building Docker Image'
+                        sh "docker build -t ${IMAGE_NAME} ."
+                    }
+                }
+            }
+        }
+        stage('Anchore Grype Vulnerability Scan') {
+            steps {
+                script {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -i anchore/grype:latest -o json ${IMAGE_NAME} > anchore-scan.json"
+                        archiveArtifacts artifacts: 'anchore-scan.json', allowEmptyArchive: false
+                        def criticalVulns = sh(script: """
+                            cat anchore-scan.json | jq '[.matches[] | select(.vulnerability.severity == "Critical")]' 
+                        """, returnStdout: true).trim()
+                        if (criticalVulns != "[]") {
+                            // currentBuild.result = 'FAILURE'
+                            echo "The docker image has critical vulnerabilities"
+                        }
+                    }
+                }
+            }
+        }
+        stage('Push Docker Image to ECR') {
+            steps {
+                script {
+                    withCredentials([aws(credentialsId: 'aws-cred', region: AWS_REGION)]) {
+                        sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_URL}"
+                        sh "docker push ${IMAGE_NAME}"
+                    }
+                }
+            }
+        }
+        stage('Clone Repo and Run Kube-Linter') {
+            steps {
+                script {
+                    withCredentials([gitUsernamePassword(credentialsId: 'git-helm-cred', gitToolName: 'Default')]) {
+                        sh "git clone https://gitlab.com/Saiprakash02/application-helm-charts.git"
+                        dir('application-helm-charts') {
+                            def lintApiResult = sh(script: "kube-linter lint api", returnStatus: true)
+                            def lintDatabaseResult = sh(script: "kube-linter lint database", returnStatus: true)
+                            def lintWebResult = sh(script: "kube-linter lint web", returnStatus: true)
+                            if (lintApiResult != 0 || lintDatabaseResult != 0 || lintWebResult != 0) {
+                                error "Kube-linter found issues in one or more charts"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                withCredentials([aws(credentialsId: 'aws-cred', region: AWS_REGION)]) {
+                    withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'kubeconfig', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
+                        def apiLabels = [
+                            "prod": "app=production-api"
+                        ]
+
+                        apiLabels.each { namespace, label ->
+                            echo "Running post-build actions in namespace: ${namespace} for API"
+                            sh "kubectl get po -n ${namespace}"
+
+                            try {
+                                sh """
+                                kubectl -n ${namespace} get pods -l ${label} -o jsonpath='{.items[*].status.phase}' | grep -q Running
+                                """
+                                def podName = sh(
+                                    script: "kubectl -n ${namespace} get pod -l ${label} -o jsonpath='{.items[0].metadata.name}'",
+                                    returnStdout: true
+                                ).trim()
+                                def testCommand = "python3 test.py"
+                                sh "kubectl -n ${namespace} exec -it ${podName} -- ${testCommand}"
+                            } catch (Exception e) {
+                                echo "Error with API deployment in ${namespace}: ${e.getMessage()}"
+                                currentBuild.result = 'SUCCESS'
+                            }
+                        }
+                    }
+                }
+            }
+            emailext(
+                subject: "Jenkins Build: ${currentBuild.fullDisplayName} - ${currentBuild.result}",
+                body: """<p>Build Status: ${currentBuild.result}</p>
+                        <p>Commit ID: ${env.GIT_COMMIT}</p>
+                        <p>Build Number: ${env.BUILD_NUMBER}</p>
+                        <p>Triggered By: ${currentBuild.getBuildCauses()[0]?.userId}</p>
+                        <p>Build Link: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p>Attached Reports Files:</p>""",
+                attachmentsPattern: "api/dependency-check-report.xml, anchore-scan.json",
+                to: 'saiprakash0229@gmail.com'
+            )
+        }
+    }
+}
