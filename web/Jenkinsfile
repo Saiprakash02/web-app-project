@@ -170,7 +170,7 @@ CMD ["npm", "run", "serve"]
                 withCredentials([aws(credentialsId: 'aws-cred', region: AWS_REGION)]) {
                     withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'kubeconfig', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
                         def webLabels = [
-                            "prod": "app=production"
+                            "dev": "app=development"
                         ]
 
                         webLabels.each { namespace, label ->
